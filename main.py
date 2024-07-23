@@ -1,8 +1,8 @@
 import os
-import sys
 import requests
 import json
 from datetime import datetime
+import pytz
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from dotenv import load_dotenv
@@ -12,18 +12,15 @@ load_dotenv()
 
 # Environment variables
 VAPI_URL = os.getenv('VAPI_URL')
-PEPFACTOR_OUT_ASSISTANT_ID = os.getenv('ASSISTANT_ID')
-PEPFACTOR_IN_ASSISTANT_ID = os.getenv('INBOUND_ASSISTANT_ID')
-GREYCORP_OUT_ASSISTANT_ID = os.getenv('GREYCORP_OUT_ASSISTANT_ID')
-GREYCORP_IN_ASSISTANT_ID = os.getenv('GREYCORP_IN_ASSISTANT_ID')
+ASSISTANT_ID = os.getenv('ASSISTANT_ID')
 BEARER_TOKEN = os.getenv('BEARER_TOKEN')
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 SERVICE_ACCOUNT_FILE = os.getenv('SERVICE_ACCOUNT_FILE')
 
+# Timezone for Sydney, Australia
+SYDNEY_TZ = pytz.timezone('Australia/Sydney')
+
 # Function to fetch call logs from the Vapi API
-# Instead of using page numbers, the Vapi API uses cursor-based pagination. 
-# We implement this by using the createdAtLt parameter and set it to the createdAt timestamp of the last
-# call in the current batch of requests
 def fetch_call_logs(url, assistant_id, bearer_token):
     headers = {
         "Authorization": f"Bearer {bearer_token}"
@@ -46,14 +43,10 @@ def fetch_call_logs(url, assistant_id, bearer_token):
         all_calls.extend(data)
         
         # Check if we've reached the end of the available data
-        # If we receive fewer calls than the limit, it means we're on the last page so we exit the loop
         if len(data) < params["limit"]:
             break
         
         # Prepare for the next page by updating the createdAtLt parameter
-        # This is how we implement cursor-based pagination
-        # We use the createdAt timestamp of the last call in the current batch
-        # as the starting point for the next request
         params["createdAtLt"] = data[-1]["createdAt"]
     
     print(f"Total calls fetched: {len(all_calls)}")
@@ -66,29 +59,46 @@ def calculate_duration(start_time, end_time):
     duration = (end - start).total_seconds()
     return duration
 
-# Function to filter calls that last longer than a specified duration
-def filter_calls(calls, min_duration=20):
-    filtered_calls = []
+# Function to format datetime to dd/mm/yyyy hh:mm:ss
+def format_datetime(dt_str):
+    dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+    dt_sydney = dt.astimezone(SYDNEY_TZ)
+    return dt_sydney.strftime('%d/%m/%Y %I:%M:%S %p')
+
+# Function to extract relevant call information
+def extract_call_info(calls):
+    call_info = []
     for call in calls:
         if 'startedAt' in call and 'endedAt' in call:
             try:
                 duration = calculate_duration(call['startedAt'], call['endedAt'])
-                if duration > min_duration:
-                    phone_number = call.get('customer', {}).get('number', 'N/A')
-                    analysis = call.get('analysis', {})
-                    filtered_calls.append([
-                        call['id'],
-                        phone_number,
-                        duration,
-                        call['startedAt'],
-                        call['endedAt'],
-                        analysis.get('summary', 'N/A'),
-                        analysis.get('successEvaluation', 'N/A'),
-                        call['transcript']
-                    ])
+                phone_number = call.get('customer', {}).get('number', 'N/A')
+                analysis = call.get('analysis', {})
+                costBreakdown = call.get('costBreakdown', {})
+                analysisCostBreakdown = costBreakdown.get('analysisCostBreakdown', {})
+                call_info.append([
+                    call['id'],
+                    phone_number,
+                    duration,
+                    format_datetime(call['startedAt']),
+                    format_datetime(call['endedAt']),
+                    analysis.get('summary', 'N/A'),
+                    analysis.get('successEvaluation', 'N/A'),
+                    call['transcript'],
+                    call['endedReason'],
+                    call['recordingUrl'], 
+                    costBreakdown.get('total', 'N/A'), # total cost of the call in USD.
+                    costBreakdown.get('stt', 'N/A'), # cost of the speech-to-text service
+                    costBreakdown.get('llm', 'N/A'), # cost of the language model
+                    costBreakdown.get('tts', 'N/A'), # cost of the text-to-speech service
+                    costBreakdown.get('vapi', 'N/A'), # cost of Vapi
+                    analysisCostBreakdown.get('summary', 'N/A'), # cost to summarize the call 
+                    analysisCostBreakdown.get('structuredData', 'N/A'), # cost to extract structured data from the call
+                    analysisCostBreakdown.get('successEvaluation', 'N/A'), # cost to evaluate if the call was successful
+                ])
             except ValueError as e:
                 print(f"Error calculating duration for call {call['id']}: {str(e)}")
-    return filtered_calls
+    return call_info
 
 # Function to update the Google Sheet with call data
 def update_google_sheet(service_account_file, spreadsheet_id, range_name, data):
@@ -103,62 +113,19 @@ def update_google_sheet(service_account_file, spreadsheet_id, range_name, data):
 
     return result
 
-def update_pepfactor_outbound():
-    out_calls = fetch_call_logs(VAPI_URL, PEPFACTOR_OUT_ASSISTANT_ID, BEARER_TOKEN)
-    filtered_out_calls = filter_calls(out_calls)
-    RANGE_NAME = 'pepfactor_outbound!A1:H'  # Adjust if needed: {SheetName}!{Range}
-    values = [['ID', 'Phone Number', 'Duration (seconds)', 'Start Time', 'End Time', 'Summary', 'Success Evaluation', 'Transcript']] + filtered_out_calls
-    result = update_google_sheet(SERVICE_ACCOUNT_FILE, SPREADSHEET_ID, RANGE_NAME, values)
-    print(f"{result.get('updatedCells')} cells updated for PepFactor outbound calls.")
+# Main function to fetch call logs, extract info, and update the Google Sheet
+def main():
+    calls = fetch_call_logs(VAPI_URL, ASSISTANT_ID, BEARER_TOKEN)
+    call_info = extract_call_info(calls)
 
-def update_pepfactor_inbound():
-    in_calls = fetch_call_logs(VAPI_URL, PEPFACTOR_IN_ASSISTANT_ID, BEARER_TOKEN)
-    filtered_in_calls = filter_calls(in_calls)
-    RANGE_NAME = 'pepfactor_inbound!A1:H'
-    values = [['ID', 'Phone Number', 'Duration (seconds)', 'Start Time', 'End Time', 'Summary', 'Success Evaluation', 'Transcript']] + filtered_in_calls
-    result = update_google_sheet(SERVICE_ACCOUNT_FILE, SPREADSHEET_ID, RANGE_NAME, values)
-    print(f"{result.get('updatedCells')} cells updated for PepFactor inbound calls.")
+    # Google Sheets Export
+    RANGE_NAME = 'Sheet1!A1:Z'  # Adjust based on your needs
 
-def update_greycorp_outbound():
-    calls = fetch_call_logs(VAPI_URL, GREYCORP_OUT_ASSISTANT_ID, BEARER_TOKEN)
-    filtered_calls = filter_calls(calls)
-    RANGE_NAME = 'greycorp_outbound!A1:H'
-    values = [['ID', 'Phone Number', 'Duration (seconds)', 'Start Time', 'End Time', 'Summary', 'Success Evaluation', 'Transcript']] + filtered_calls
-    result = update_google_sheet(SERVICE_ACCOUNT_FILE, SPREADSHEET_ID, RANGE_NAME, values)
-    print(f"{result.get('updatedCells')} cells updated for GreyCorp outbound calls.")
+    # Prepare the data
+    values = [['ID', 'Phone Number', 'Duration (s)', 'Start Time', 'End Time', 'Summary', 'Success Evaluation', 'Transcript', 'Ended Reason', 'Recording Url', 'Total Cost (USD)', 'STT Cost', 'LLM Cost', 'TTS Cost', 'Vapi Cost', 'Summary Cost', 'Structured Data Cost', 'Success Evaluation Cost']] + call_info
 
-def update_greycorp_inbound():
-    calls = fetch_call_logs(VAPI_URL, GREYCORP_IN_ASSISTANT_ID, BEARER_TOKEN)
-    filtered_calls = filter_calls(calls)
-    RANGE_NAME = 'greycorp_inbound!A1:H'
-    values = [['ID', 'Phone Number', 'Duration (seconds)', 'Start Time', 'End Time', 'Summary', 'Success Evaluation', 'Transcript']] + filtered_calls
     result = update_google_sheet(SERVICE_ACCOUNT_FILE, SPREADSHEET_ID, RANGE_NAME, values)
-    print(f"{result.get('updatedCells')} cells updated for GreyCorp inbound calls.")
-
-# Main function to fetch call logs, filter them, and update the Google Sheet
-def main(sheet_name=None):
-    if sheet_name is None:
-        # Update all sheets
-        update_pepfactor_outbound()
-        update_pepfactor_inbound()
-        update_greycorp_outbound()
-        update_greycorp_inbound()
-    elif sheet_name == "pepfactor_outbound":
-        update_pepfactor_outbound()
-    elif sheet_name == "pepfactor_inbound":
-        update_pepfactor_inbound()
-    elif sheet_name == "greycorp_outbound":
-        update_greycorp_outbound()
-    elif sheet_name == "greycorp_inbound":
-        update_greycorp_inbound()
-    else:
-        print("Invalid sheet name")
-        return
+    print(f"{result.get('updatedCells')} cells updated.")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 2:
-        print("Usage: python main.py <SheetName>")
-        sys.exit(1)
-
-    sheet_name = sys.argv[1] if len(sys.argv) == 2 else None
-    main(sheet_name)
+    main()
